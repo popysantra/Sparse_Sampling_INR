@@ -11,6 +11,7 @@ from torch.nn import functional as F
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim import lr_scheduler
 from sampling_strategy import SamplingType, SamplingConfig, get_sampling_strategy
+from vtk.util.numpy_support import vtk_to_numpy
 ##########################################################
 
 
@@ -45,7 +46,7 @@ def recon_data(model, np_arr_coord, np_arr_vals, group_size, device):
 
     return predicted_vals.cpu().numpy().squeeze()
 
-def save_volume(data, varname, extracted_vals1, outdata_path, dataset_name, samp_percentage_to_use, samp_strategy):
+def save_volume(data, varname, extracted_vals1, outdata_path, dataset_name, samp_strategy, samp_percentage_to_use):
     # Now scale back to original range and then store
     min_data = data.GetPointData().GetArray(varname).GetRange()[0]
     max_data = data.GetPointData().GetArray(varname).GetRange()[1]
@@ -57,7 +58,7 @@ def save_volume(data, varname, extracted_vals1, outdata_path, dataset_name, samp
     outdata.GetPointData().AddArray(vtk_arr1)
     # Write reconstructed data out
     outfname = os.path.join(outdata_path, 'recon_' + dataset_name + 
-                            '_' + varname + '_' + samp_strategy + '_' + str(samp_percentage_to_use) + '.vti')
+                            '_' + varname + '_'+ samp_strategy + '_' + str(samp_percentage_to_use) + '.vti')
     write_vti(outdata, outfname)
 
 def data_setup(data, arrname):
@@ -77,6 +78,8 @@ def data_setup(data, arrname):
       np_arr_vals[i,:] = val1
       np_arr_coord[i,:] = pt
 
+    original_coords = np_arr_coord.copy()
+    original_vals = np_arr_vals.copy()
     min_data = np.min(np_arr_vals[:,0])
     max_data = np.max(np_arr_vals[:,0])
     np_arr_vals[:,0] = 2.0*((np_arr_vals[:,0]-min_data)/(max_data-min_data)-0.5)
@@ -85,6 +88,39 @@ def data_setup(data, arrname):
     np_arr_coord[:,0] = np_arr_coord[:,0]/dims[0]
     np_arr_coord[:,1] = np_arr_coord[:,1]/dims[1]
     np_arr_coord[:,2] = np_arr_coord[:,2]/dims[2]
+
+    return np_arr_coord, np_arr_vals, original_coords, original_vals
+
+
+def data_setup_vtp(data, arrname, dims, scalar_min_ref=None, scalar_max_ref=None):
+
+    # coordinates
+    np_arr_coord = vtk_to_numpy(
+        data.GetPoints().GetData()
+    ).astype(np.float32)
+
+    # scalar values
+    data_arr = data.GetPointData().GetArray(arrname) \
+               or data.GetPointData().GetArray(0)
+
+    if data_arr is None:
+        raise ValueError(f"No array '{arrname}' found")
+
+    np_arr_vals = vtk_to_numpy(data_arr).astype(np.float32).reshape(-1,1)
+
+    # scalar normalization
+    min_data = scalar_min_ref if scalar_min_ref is not None else np_arr_vals.min()
+    max_data = scalar_max_ref if scalar_max_ref is not None else np_arr_vals.max()
+
+    np_arr_vals[:,0] = 2.0 * (
+        (np_arr_vals[:,0] - min_data) /
+        (max_data - min_data + 1e-8) - 0.5
+    )
+
+    # coordinate normalization (same as VTI)
+    np_arr_coord[:,0] /= dims[0]
+    np_arr_coord[:,1] /= dims[1]
+    np_arr_coord[:,2] /= dims[2]
 
     return np_arr_coord, np_arr_vals
 
@@ -134,6 +170,12 @@ def create_sparse_data(coords, values, sampling_config):
 # Function to read VTI files and extract data
 def read_vti_file(file_path):
     reader = vtk.vtkXMLImageDataReader()
+    reader.SetFileName(file_path)
+    reader.Update()
+    return reader.GetOutput()
+
+def read_vtp_file(file_path):
+    reader = vtk.vtkXMLPolyDataReader()
     reader.SetFileName(file_path)
     reader.Update()
     return reader.GetOutput()

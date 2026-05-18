@@ -12,7 +12,8 @@ from scipy.spatial import cKDTree
 from scipy.stats import qmc
 import scipy as sp
 from math import floor, ceil, acos
-
+from skimage.segmentation import slic
+from skimage.util import img_as_float
 import torch
 
 
@@ -29,6 +30,7 @@ class SamplingType(Enum):
     HISTOGRAM = "histogram"               # value histogram only
     GRADIENT_HISTOGRAM = "gradient_histogram"   # gradient magnitude histogram
     HISTOGRAM_GRADIENT = "histogram_gradient"   # 2D (value, gradient)
+    SLIC = "slic"
 
     
 @dataclass
@@ -628,7 +630,105 @@ class HistogramGradientSampling(BaseSamplingStrategy):
         return coordinates[indices], values[indices]
 
 
-    
+
+
+class SLICSampling(BaseSamplingStrategy):
+    """
+    SLIC (Simple Linear Iterative Clustering) superpixel sampling for 2D grids.
+
+    Steps:
+      1. Infer grid dimensions from unique coordinates.
+      2. Reshape scalar values into a 2D image.
+      3. Apply SLIC to obtain superpixel labels.
+      4. For each superpixel, compute centroid (mean of original coordinates)
+         and mean value.
+      5. If number of superpixels != n_samples, adjust:
+         - If more superpixels: merge the smallest ones (by area) until target reached.
+         - If fewer superpixels: add random samples from the original dataset.
+      6. Return sampled points and values.
+    """
+    def sample(self, coordinates: np.ndarray, values: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if coordinates.shape[1] != 2:
+            raise ValueError("SLIC sampling is only implemented for 2D coordinates.")
+
+        # 1. Infer grid dimensions
+        x_vals = coordinates[:, 0]
+        y_vals = coordinates[:, 1]
+        # Assuming regular grid: use unique sorted coordinates
+        x_unique = np.sort(np.unique(x_vals))
+        y_unique = np.sort(np.unique(y_vals))
+        nx, ny = len(x_unique), len(y_unique)
+        expected_pts = nx * ny
+        if expected_pts != coordinates.shape[0]:
+            raise ValueError("Coordinates do not form a regular grid (unique counts mismatch).")
+
+        # Reshape values into 2D image
+        img = values.reshape(ny, nx).T   # shape (nx, ny) or (ny, nx)? Let's make it (ny, nx) for image
+        # SLIC expects (height, width) array. We'll reshape to (ny, nx)
+        img_2d = values.reshape(ny, nx)  # now rows = y, cols = x
+
+        # 2. Run SLIC
+        # Determine number of superpixels: heuristic ~ target samples / 2 (to allow merging)
+        n_segments = max(2, int(self.config.n_samples * 1.5))
+        compactness = 10.0  # default, can be made configurable
+        segments = slic(img_2d, n_segments=n_segments, compactness=compactness, start_label=0)
+
+        # 3. Compute per‑segment representatives
+        unique_segments = np.unique(segments)
+        seg_centroids = []
+        seg_means = []
+        for seg_id in unique_segments:
+            mask = (segments == seg_id)
+            # Get indices of points belonging to this superpixel in the original dataset
+            # We need to map from 2D indices to linear index
+            rows, cols = np.where(mask)
+            # Convert to original coordinate values
+            xs = x_unique[cols]
+            ys = y_unique[rows]
+            centroid_x = np.mean(xs)
+            centroid_y = np.mean(ys)
+            mean_val = np.mean(img_2d[mask])
+            seg_centroids.append([centroid_x, centroid_y])
+            seg_means.append(mean_val)
+
+        seg_centroids = np.array(seg_centroids)
+        seg_means = np.array(seg_means)
+        current_n = len(seg_centroids)
+
+        # 4. Adjust to exact target
+        target = self.config.n_samples
+        if current_n > target:
+            # Need to merge superpixels: repeatedly merge the smallest (by area) adjacent?
+            # Simplified: randomly sample `target` centroids
+            chosen = self.rng.choice(current_n, size=target, replace=False)
+            sampled_coords = seg_centroids[chosen]
+            sampled_vals = seg_means[chosen]
+        elif current_n < target:
+            # Need more points: add random samples from the original dataset
+            extra = target - current_n
+            all_indices = np.arange(coordinates.shape[0])
+            extra_indices = self.rng.choice(all_indices, size=extra, replace=False)
+            extra_coords = coordinates[extra_indices]
+            extra_vals = values[extra_indices]
+            sampled_coords = np.vstack([seg_centroids, extra_coords])
+            sampled_vals = np.concatenate([seg_means, extra_vals])
+            # Shuffle to mix
+            perm = self.rng.permutation(len(sampled_coords))
+            sampled_coords = sampled_coords[perm]
+            sampled_vals = sampled_vals[perm]
+        else:
+            sampled_coords = seg_centroids
+            sampled_vals = seg_means
+
+        # Indices: find nearest neighbor in original dataset
+        tree = cKDTree(coordinates)
+        _, indices = tree.query(sampled_coords)
+        return sampled_coords, sampled_vals
+
+
+
+
+
 def get_sampling_strategy(config: SamplingConfig) -> BaseSamplingStrategy:
     """Factory function to get the appropriate sampling strategy."""
     strategies = {
@@ -643,6 +743,7 @@ def get_sampling_strategy(config: SamplingConfig) -> BaseSamplingStrategy:
         SamplingType.HISTOGRAM: HistogramSampling,
         SamplingType.GRADIENT_HISTOGRAM: GradientHistogramSampling,
         SamplingType.HISTOGRAM_GRADIENT: HistogramGradientSampling,
+        SamplingType.SLIC: SLICSampling,
     }
 
     strategy_class = strategies.get(config.sampling_type)
